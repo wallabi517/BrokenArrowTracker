@@ -1,6 +1,7 @@
 bin/
 obj/
 release/
+preview-*/
 *.user
 *.suo
 *.etl

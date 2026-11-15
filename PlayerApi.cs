@@ -12,39 +12,46 @@ public sealed class PlayerApi
     private readonly SemaphoreSlim requestSlots = new(4, 4);
     public PlayerApi() => http.DefaultRequestHeaders.UserAgent.ParseAdd("ArrowScope-SquadTracker/0.4 (+local desktop tool)");
 
-    public async Task<PlayerResult?> SearchAsync(string name, CancellationToken ct)
+    public async Task<PlayerResult?> SearchAsync(string name, CancellationToken ct, string? playerId = null)
     {
-        var key = name.Trim();
+        var key = string.IsNullOrWhiteSpace(playerId) ? name.Trim() : $"id:{playerId}";
         if (cache.TryGetValue(key, out var cached) && cached.ExpiresUtc > DateTime.UtcNow) return cached.Result;
 
         await requestSlots.WaitAsync(ct);
         try
         {
             if (cache.TryGetValue(key, out cached) && cached.ExpiresUtc > DateTime.UtcNow) return cached.Result;
-            var result = await SearchCoreAsync(key, ct);
+            var result = await SearchCoreAsync(name.Trim(), playerId, ct);
+            DiagnosticLog.Write("BATRACE", result is null ? $"not-found name={name} id={playerId ?? "-"}" : $"matched query={name} id={playerId ?? "-"} name={result.Name} steam={result.SteamId ?? "-"}");
             cache[key] = new CacheEntry(result, DateTime.UtcNow.Add(result is null ? TimeSpan.FromSeconds(30) : TimeSpan.FromMinutes(5)));
             return result;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            DiagnosticLog.Write("BATRACE", $"error name={key} message={ex.Message}");
+            throw;
         }
         finally { requestSlots.Release(); }
     }
 
-    private async Task<PlayerResult?> SearchCoreAsync(string name, CancellationToken ct)
+    private async Task<PlayerResult?> SearchCoreAsync(string name, string? playerId, CancellationToken ct)
     {
-        var url = $"https://dash.batrace.top/api/players/search?q={Uri.EscapeDataString(name)}&limit=8";
+        var query = string.IsNullOrWhiteSpace(playerId) ? name : playerId;
+        var url = $"https://dash.batrace.top/api/players/search?q={Uri.EscapeDataString(query)}&limit=8";
         var root = JsonNode.Parse(await http.GetStringAsync(url, ct));
         var players = root?["players"]?.AsArray();
         if (players is null || players.Count == 0) return null;
         var objects = players.OfType<JsonObject>().ToArray();
         var candidate = objects.FirstOrDefault(p =>
-            string.Equals(Read(p, "name"), name, StringComparison.OrdinalIgnoreCase) ||
+            (!string.IsNullOrWhiteSpace(playerId) && string.Equals(Read(p, "id"), playerId, StringComparison.Ordinal)) ||
+            (string.IsNullOrWhiteSpace(playerId) && string.Equals(Read(p, "name"), name, StringComparison.OrdinalIgnoreCase)) ||
             string.Equals(Read(p, "steam_id"), name, StringComparison.Ordinal));
         if (candidate is null) return null;
         var id = Read(candidate, "id") ?? "-";
-        var steamId = Read(candidate, "steam_id");
-        var detailsTask = ReadDetailedStatsAsync(id, ct);
-        var avatarTask = ReadSteamAvatarAsync(steamId, ct);
-        var details = await detailsTask;
-        var avatarUrl = await avatarTask;
+        var details = await ReadDetailedStatsAsync(id, ct);
+        var steamId = Read(candidate, "steam_id") ?? details.SteamId;
+        var avatarUrl = await ReadSteamAvatarAsync(steamId, ct);
         return new(Read(candidate, "name") ?? name, id, steamId,
             details.Elo ?? Number(candidate, "rating"), details.Rank ?? Int(candidate, "rank"),
             details.Level ?? Int(candidate, "level"), details.RatingGames ?? Int(candidate, "rating_games"),
@@ -76,10 +83,13 @@ public sealed class PlayerApi
             var dealt = matches.Sum(match => ParseDouble(match.Groups["dealt"].Value) ?? 0);
             var lost = matches.Sum(match => ParseDouble(match.Groups["lost"].Value) ?? 0);
             double? kd = matches.Length == 0 ? null : lost == 0 ? dealt : dealt / lost;
-            return new DetailedStats(kd, turtle, DetailDouble(info, "rating"), DetailInt(info, "rank"),
-                DetailInt(info, "level"), DetailInt(info, "ratingGames"));
+            var currentRating = matches.Select(match => ParseDouble(
+                Regex.Match(match.Value, "\\\"NewRating\\\":(?<v>[0-9.]+)").Groups["v"].Value))
+                .Where(value => value is not null).LastOrDefault();
+            return new DetailedStats(kd, turtle, DetailDouble(info, "rating") ?? currentRating, DetailInt(info, "rank"),
+                DetailInt(info, "level"), DetailInt(info, "ratingGames"), DetailString(info, "steamId"));
         }
-        catch { return new DetailedStats(null, null, null, null, null, null); }
+        catch { return new DetailedStats(null, null, null, null, null, null, null); }
     }
 
     private static double? DetailDouble(string body, string name) => ParseDouble(
@@ -87,6 +97,11 @@ public sealed class PlayerApi
     private static int? DetailInt(string body, string name) =>
         int.TryParse(Regex.Match(body, $"\"{Regex.Escape(name)}\":(?<v>-?[0-9]+)").Groups["v"].Value,
             NumberStyles.Integer, CultureInfo.InvariantCulture, out var value) ? value : null;
+    private static string? DetailString(string body, string name)
+    {
+        var value = Regex.Match(body, $"\"{Regex.Escape(name)}\":\"(?<v>[^\"]+)\"").Groups["v"].Value;
+        return string.IsNullOrWhiteSpace(value) ? null : value;
+    }
 
     private static double? ParseDouble(string value) =>
         double.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var result) ? result : null;
@@ -100,5 +115,6 @@ public sealed class PlayerApi
     private static DateTimeOffset? Date(JsonObject value, string key) =>
         DateTimeOffset.TryParse(Read(value, key), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var result) ? result : null;
     private sealed record CacheEntry(PlayerResult? Result, DateTime ExpiresUtc);
-    private sealed record DetailedStats(double? Kd, double? Turtle, double? Elo, int? Rank, int? Level, int? RatingGames);
+    private sealed record DetailedStats(double? Kd, double? Turtle, double? Elo, int? Rank, int? Level,
+        int? RatingGames, string? SteamId);
 }
