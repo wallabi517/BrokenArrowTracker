@@ -1,0 +1,10 @@
+bin/
+obj/
+release/
+*.user
+*.suo
+*.etl
+*.pcap
+*.pcapng
+*.log
+.vs/
