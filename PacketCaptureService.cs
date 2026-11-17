@@ -40,6 +40,9 @@ public sealed class PacketCaptureService : IDisposable
     private readonly HashSet<string> pendingPlayers = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, byte> trustedLobbyPlayers = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<long, MatchPlayer> currentMatchPlayers = new();
+    private readonly Dictionary<long, string> waitingRoomPlayers = new();
+    private readonly Dictionary<long, string> preMatchPartyPlayers = new();
+    private readonly HashSet<string> currentCandidateMaps = new(StringComparer.OrdinalIgnoreCase);
     private Task? worker;
     private string? currentRoomName;
     private DateTime lastLobbyPacketUtc = DateTime.MinValue;
@@ -167,10 +170,23 @@ public sealed class PacketCaptureService : IDisposable
     {
         var lobby = PcapLobbyParser.FindLobby(pcap);
         var now = DateTime.UtcNow;
+        if (lobby.CandidateMaps is { Count: > 0 })
+        {
+            foreach (var map in lobby.CandidateMaps) currentCandidateMaps.Add(map);
+            DiagnosticLog.Write("MAP", $"패킷 맵 후보=[{string.Join(" | ", currentCandidateMaps)}]");
+        }
         IReadOnlyList<MatchPlayer> structuredPlayers = lobby.MatchPlayers ?? Array.Empty<MatchPlayer>();
         if (lobby.MatchPlayers is { Count: > 0 })
         {
-            foreach (var player in lobby.MatchPlayers) currentMatchPlayers[player.Id] = player;
+            if (preMatchPartyPlayers.Count > 0)
+                foreach (var partyPlayer in preMatchPartyPlayers)
+                    currentMatchPlayers[partyPlayer.Key] = new MatchPlayer(partyPlayer.Key, partyPlayer.Value, 1);
+            foreach (var player in lobby.MatchPlayers)
+            {
+                var normalizedPlayer = preMatchPartyPlayers.Count == 0 ? player :
+                    player with { Team = IsPreMatchPartyPlayer(player.Id, player.Name) ? 1 : 2 };
+                currentMatchPlayers[player.Id] = normalizedPlayer;
+            }
             var hasBothTeams = currentMatchPlayers.Values.Any(player => player.Team == 1) &&
                                currentMatchPlayers.Values.Any(player => player.Team == 2);
             if (inMatch || hasBothTeams)
@@ -182,10 +198,11 @@ public sealed class PacketCaptureService : IDisposable
                     currentRoomName = null;
                 }
                 inMatch = true;
+                if (waitingRoomPlayers.Count > 0) CompleteMatchRosterFromWaitingRoom();
                 var roster = currentMatchPlayers.Values.OrderBy(player => player.Team).ThenBy(player => player.Name).ToArray();
                 DiagnosticLog.Write("MATCH", $"players={roster.Length} roster=[{string.Join(" | ", roster.Select(player => $"{player.Name}:{player.Id}:T{player.Team}"))}]");
                 LobbyChanged?.Invoke(new LobbySnapshot(null, roster.Select(player => player.Name).ToArray(),
-                    MatchPlayers: roster));
+                    MatchPlayers: roster, CandidateMaps: currentCandidateMaps.ToArray()));
                 return;
             }
             DiagnosticLog.Write("LOBBY", $"single-team structured players=[{string.Join(" | ", structuredPlayers.Select(player => $"{player.Name}:{player.Id}:T{player.Team}"))}]");
@@ -273,9 +290,10 @@ public sealed class PacketCaptureService : IDisposable
             DiagnosticLog.Write("PACKET", $"room={currentRoomName ?? "-"} marker={lobby.HasLobbyMarker} instance={lobby.HasInstanceMarker} candidates=[{string.Join(" | ", names)}] visible=[{string.Join(" | ", visiblePlayers)}]");
             LobbyChanged?.Invoke(new LobbySnapshot(currentRoomName, visiblePlayers, hasLobbySessionMarker,
                 PlayersAreTrusted: currentRosterTrusted,
-                IdentifiedPlayers: currentMatchPlayers.Values.ToArray()));
+                IdentifiedPlayers: currentMatchPlayers.Values.ToArray(), CandidateMaps: currentCandidateMaps.ToArray()));
         }
-        else if (!inMatch && currentPlayers.Count > 0 && DateTime.UtcNow - lastLobbyPacketUtc >= TimeSpan.FromMinutes(2))
+        else if (gameLogsDirectory is null && !inMatch && currentPlayers.Count > 0 &&
+                 DateTime.UtcNow - lastLobbyPacketUtc >= TimeSpan.FromMinutes(2))
         {
             currentPlayers.Clear();
             currentRoomName = null;
@@ -331,9 +349,56 @@ public sealed class PacketCaptureService : IDisposable
             var leftPlayers = new List<string>();
             var leftPlayerIds = new List<long>();
             var rosterChanges = new List<(bool Joined, string Name)>();
+            var sawWaitingRoomPlayer = false;
+            var sawGameRoomEntered = false;
+            var sawGameRoomRoster = false;
             string? line;
             while ((line = reader.ReadLine()) is not null)
             {
+                var gameRoomPlayer = Regex.Match(line,
+                    @"^ID:\s*(?<id>\d+),\s*Name:\s*(?<name>.+),\s*Team:\s*(?<team>Alpha|Bravo)\s*$",
+                    RegexOptions.IgnoreCase);
+                if (gameRoomPlayer.Success &&
+                    long.TryParse(gameRoomPlayer.Groups["id"].Value, out var gameRoomPlayerId))
+                {
+                    var name = gameRoomPlayer.Groups["name"].Value.Trim();
+                    var packetTeam = gameRoomPlayer.Groups["team"].Value.Equals("Alpha", StringComparison.OrdinalIgnoreCase) ? 1 : 2;
+                    var team = preMatchPartyPlayers.Count > 0
+                        ? (IsPreMatchPartyPlayer(gameRoomPlayerId, name) ? 1 : 2)
+                        : packetTeam;
+                    currentMatchPlayers[gameRoomPlayerId] = new MatchPlayer(gameRoomPlayerId, name, team);
+                    waitingRoomPlayers[gameRoomPlayerId] = name;
+                    sawGameRoomRoster = true;
+                }
+                if (line.Contains("Stage=Game", StringComparison.OrdinalIgnoreCase) &&
+                    line.Contains("Action=Entered", StringComparison.OrdinalIgnoreCase) &&
+                    line.Contains("RoomType=GameRoom", StringComparison.OrdinalIgnoreCase))
+                {
+                    currentCandidateMaps.Clear();
+                    sawGameRoomEntered = true;
+                    DiagnosticLog.Write("MAP", "게임 시작 - 맵 선택 패널 종료");
+                }
+                var loadingMap = Regex.Match(line, @"Start loading battle\.\.\. map:\s*(?<map>.+?),\s*scenario:",
+                    RegexOptions.IgnoreCase);
+                if (loadingMap.Success)
+                {
+                    var detected = MapWinRateCatalog.FindInText(loadingMap.Groups["map"].Value);
+                    if (detected.Count > 0)
+                    {
+                        currentCandidateMaps.Clear();
+                        foreach (var map in detected) currentCandidateMaps.Add(map);
+                        DiagnosticLog.Write("MAP", $"최종 맵=[{string.Join(" | ", currentCandidateMaps)}]");
+                    }
+                }
+                var waitingRoomPlayer = Regex.Match(line,
+                    @"Room: \(WaitingRoom\|\d+\), Client: \((?<name>.+)\|(?<id>\d+)\)",
+                    RegexOptions.IgnoreCase);
+                if (waitingRoomPlayer.Success &&
+                    long.TryParse(waitingRoomPlayer.Groups["id"].Value, out var waitingRoomPlayerId))
+                {
+                    waitingRoomPlayers[waitingRoomPlayerId] = waitingRoomPlayer.Groups["name"].Value.Trim();
+                    sawWaitingRoomPlayer = true;
+                }
                 var lifecycle = Regex.Match(line,
                     @"Stage=Lobby\s*\|\s*Action=(?<action>Entered|Exited).*?LobbyId=(?<id>\d+)",
                     RegexOptions.IgnoreCase);
@@ -342,26 +407,32 @@ public sealed class PacketCaptureService : IDisposable
                     var eventLobbyId = lifecycle.Groups["id"].Value;
                     if (lifecycle.Groups["action"].Value.Equals("Entered", StringComparison.OrdinalIgnoreCase))
                     {
+                        preMatchPartyPlayers.Clear();
                         if (!string.Equals(currentLobbyId, eventLobbyId, StringComparison.Ordinal))
                         {
                             // A new lobby can follow an Exited event whose LobbyId is 0.
-                            // Drop verified names from the previous room, retaining only
-                            // players identified by the new room's structured packets.
-                            var identifiedNames = currentMatchPlayers.Values.Select(player => player.Name)
-                                .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+                            // Nothing from the previous lobby is valid in the new room;
+                            // its structured roster will arrive again after Entered.
                             trustedLobbyPlayers.Clear();
-                            foreach (var name in identifiedNames) trustedLobbyPlayers.TryAdd(name, 0);
                             currentPlayers.Clear();
-                            foreach (var name in identifiedNames) currentPlayers.Add(name);
-                            if (!string.IsNullOrWhiteSpace(localPlayerName)) currentPlayers.Add(localPlayerName);
-                            currentRosterTrusted = identifiedNames.Length > 0;
+                            pendingPlayers.Clear();
+                            currentMatchPlayers.Clear();
+                            waitingRoomPlayers.Clear();
+                            currentCandidateMaps.Clear();
+                            currentRoomName = null;
+                            currentRosterTrusted = false;
+                            DiagnosticLog.Write("LOBBY", $"새 로비 전환 old={currentLobbyId ?? "-"} new={eventLobbyId}");
                         }
                         currentLobbyId = eventLobbyId;
                         pendingLobbyExitUtc = null;
                         sawLobbyEntered = true;
                     }
                     else if (string.Equals(currentLobbyId, eventLobbyId, StringComparison.Ordinal))
+                    {
+                        if (line.Contains("Status=Searching", StringComparison.OrdinalIgnoreCase))
+                            CapturePreMatchParty();
                         shouldEndLobby = true;
+                    }
                 }
                 var joined = Regex.Match(line, @"Incoming client (?<name>.+?):(?<playerId>\d+) to lobby \(id: (?<lobbyId>\d+)", RegexOptions.IgnoreCase);
                 if (joined.Success && (currentLobbyId is null || joined.Groups["lobbyId"].Value == currentLobbyId))
@@ -390,6 +461,14 @@ public sealed class PacketCaptureService : IDisposable
                     shouldEndMatch = true;
             }
             monitoredGameLogPosition = stream.Position;
+            if (sawWaitingRoomPlayer && inMatch) CompleteMatchRosterFromWaitingRoom();
+            if (sawGameRoomRoster && currentMatchPlayers.Count > 0)
+            {
+                inMatch = true;
+                EmitCompletedMatchRoster("GameRoom 로그 전체 명단 보완");
+            }
+            if (sawGameRoomEntered && inMatch && currentMatchPlayers.Count > 0)
+                EmitCompletedMatchRoster("게임 시작 화면 전환");
             if (sawLobbyEntered) pendingLobbyExitUtc = null;
             else if (shouldEndLobby && !inMatch) pendingLobbyExitUtc = DateTime.UtcNow;
             FinalizePendingLobbyExit();
@@ -405,13 +484,14 @@ public sealed class PacketCaptureService : IDisposable
                 currentPlayers.Clear();
                 foreach (var name in trustedLobbyPlayers.Keys) currentPlayers.Add(name);
                 if (!string.IsNullOrWhiteSpace(localPlayerName)) currentPlayers.Add(localPlayerName);
+                lastLobbyPacketUtc = DateTime.UtcNow;
                 var visiblePlayers = string.IsNullOrWhiteSpace(localPlayerName)
                     ? currentPlayers.Take(64).ToArray()
                     : currentPlayers.Where(name => !name.Equals(localPlayerName, StringComparison.OrdinalIgnoreCase))
                         .Take(63).Prepend(localPlayerName).ToArray();
                 DiagnosticLog.Write("LOBBY", $"로그 명단 갱신 joined=[{string.Join(" | ", joinedPlayers)}] left=[{string.Join(" | ", leftPlayers)}]");
                 LobbyChanged?.Invoke(new LobbySnapshot(currentRoomName, visiblePlayers, PlayersAreTrusted: true,
-                    IdentifiedPlayers: currentMatchPlayers.Values.ToArray()));
+                    IdentifiedPlayers: currentMatchPlayers.Values.ToArray(), CandidateMaps: currentCandidateMaps.ToArray()));
             }
             if (shouldEndMatch && inMatch) EndMatch("게임 종료 로그 감지");
         }
@@ -429,6 +509,51 @@ public sealed class PacketCaptureService : IDisposable
         !string.IsNullOrWhiteSpace(name) && name.Length <= 64 &&
         !name.Equals("Bot", StringComparison.OrdinalIgnoreCase);
 
+    private void CompleteMatchRosterFromWaitingRoom()
+    {
+        var missing = waitingRoomPlayers.Where(entry => !currentMatchPlayers.ContainsKey(entry.Key)).ToArray();
+        if (missing.Length == 0) return;
+        if (preMatchPartyPlayers.Count > 0)
+        {
+            foreach (var entry in missing)
+                currentMatchPlayers[entry.Key] = new MatchPlayer(entry.Key, entry.Value,
+                    IsPreMatchPartyPlayer(entry.Key, entry.Value) ? 1 : 2);
+            EmitCompletedMatchRoster($"사전 로비 기준 보완 count={missing.Length}");
+            return;
+        }
+        if (missing.Length != 1) return;
+        var team1Count = currentMatchPlayers.Values.Count(player => player.Team == 1);
+        var team2Count = currentMatchPlayers.Values.Count(player => player.Team == 2);
+        var missingTeam = team1Count == 4 && team2Count == 5 ? 1 :
+            team2Count == 4 && team1Count == 5 ? 2 : 0;
+        if (missingTeam == 0) return;
+
+        var player = new MatchPlayer(missing[0].Key, missing[0].Value, missingTeam);
+        currentMatchPlayers[player.Id] = player;
+        EmitCompletedMatchRoster($"WaitingRoom 보완 player={player.Name}:{player.Id}:T{player.Team}");
+    }
+
+    private void CapturePreMatchParty()
+    {
+        preMatchPartyPlayers.Clear();
+        foreach (var player in currentMatchPlayers.Values)
+            if (currentPlayers.Contains(player.Name) || trustedLobbyPlayers.ContainsKey(player.Name))
+                preMatchPartyPlayers[player.Id] = player.Name;
+        DiagnosticLog.Write("MATCH", $"사전 로비 아군 저장 count={preMatchPartyPlayers.Count} players=[{string.Join(" | ", preMatchPartyPlayers.Select(item => $"{item.Value}:{item.Key}"))}]");
+    }
+
+    private bool IsPreMatchPartyPlayer(long id, string name) =>
+        preMatchPartyPlayers.ContainsKey(id) ||
+        preMatchPartyPlayers.Values.Contains(name, StringComparer.OrdinalIgnoreCase) ||
+        (!string.IsNullOrWhiteSpace(localPlayerName) && name.Equals(localPlayerName, StringComparison.OrdinalIgnoreCase));
+
+    private void EmitCompletedMatchRoster(string reason)
+    {
+        var roster = currentMatchPlayers.Values.OrderBy(item => item.Team).ThenBy(item => item.Name).ToArray();
+        DiagnosticLog.Write("MATCH", $"{reason} total={roster.Length}");
+        LobbyChanged?.Invoke(new LobbySnapshot(null, roster.Select(item => item.Name).ToArray(), MatchPlayers: roster));
+    }
+
     private void FinalizePendingLobbyExit()
     {
         if (inMatch || pendingLobbyExitUtc is null ||
@@ -444,6 +569,8 @@ public sealed class PacketCaptureService : IDisposable
         pendingPlayers.Clear();
         trustedLobbyPlayers.Clear();
         currentMatchPlayers.Clear();
+        waitingRoomPlayers.Clear();
+        currentCandidateMaps.Clear();
         currentRoomName = null;
         currentRosterTrusted = false;
         currentLobbyId = null;
@@ -460,6 +587,9 @@ public sealed class PacketCaptureService : IDisposable
         pendingPlayers.Clear();
         trustedLobbyPlayers.Clear();
         currentMatchPlayers.Clear();
+        waitingRoomPlayers.Clear();
+        preMatchPartyPlayers.Clear();
+        currentCandidateMaps.Clear();
         currentRoomName = null;
         currentRosterTrusted = false;
         inMatch = false;
@@ -542,6 +672,7 @@ public static class PcapLobbyParser
         var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var matchPlayers = new Dictionary<long, MatchPlayer>();
         var roomTitles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var candidateMaps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         string? roomName = null;
         var sawLobby = false;
         var sawInstance = false;
@@ -572,6 +703,7 @@ public static class PcapLobbyParser
             var strings = ExtractStrings(frame[data..].ToArray()).ToArray();
             foreach (var value in strings)
             {
+                foreach (var map in MapWinRateCatalog.FindInText(value)) candidateMaps.Add(map);
                 eventOrder++;
                 if (value.Contains("Lobby", StringComparison.OrdinalIgnoreCase) ||
                     value.StartsWith("Join Instance channel", StringComparison.OrdinalIgnoreCase))
@@ -584,6 +716,7 @@ public static class PcapLobbyParser
                     lastCloseOrder = eventOrder;
             }
             foreach (var player in ExtractMatchPlayers(frame[data..])) matchPlayers[player.Id] = player;
+            foreach (var map in ExtractCandidateMaps(frame[data..])) candidateMaps.Add(map);
             var lobbyIndex = Array.FindIndex(strings, x => x.Equals("Lobby", StringComparison.OrdinalIgnoreCase));
             if (lobbyIndex >= 0)
             {
@@ -613,7 +746,7 @@ public static class PcapLobbyParser
             .ThenBy(x => x.Key).Take(64).Select(x => x.Key).ToArray();
         return new LobbySnapshot(roomName, players, sawLobby,
             matchPlayers.Count == 0 && lastCloseOrder > lastLobbyOrder,
-            matchPlayers.Values.ToArray(), sawInstance);
+            matchPlayers.Values.ToArray(), sawInstance, CandidateMaps: candidateMaps.ToArray());
     }
 
     private static IReadOnlyList<MatchPlayer> ExtractMatchPlayers(ReadOnlySpan<byte> payload)
@@ -632,7 +765,7 @@ public static class PcapLobbyParser
             if (!IsStructuredPlayerName(name)) continue;
 
             var searchStart = nameStart + (int)rawLength;
-            var searchEnd = Math.Min(payload.Length - 1, searchStart + 128);
+            var searchEnd = Math.Min(payload.Length - 1, searchStart + 48);
             var sawPlayerStatusField = false;
             for (var teamOffset = searchStart; teamOffset < searchEnd; teamOffset++)
             {
@@ -643,6 +776,34 @@ public static class PcapLobbyParser
             }
         }
         return players;
+    }
+
+    private static IReadOnlyList<string> ExtractCandidateMaps(ReadOnlySpan<byte> payload)
+    {
+        var maps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (var offset = 0; offset < payload.Length - 7; offset++)
+        {
+            // Map-choice entry observed on the wire:
+            // 0A <entry-len> 08 <map-id> 12 <name-len> <short-name> ...
+            if (payload[offset] != 0x0A || payload[offset + 2] != 0x08 ||
+                payload[offset + 4] != 0x12) continue;
+            var entryLength = payload[offset + 1];
+            var mapId = payload[offset + 3];
+            var nameLength = payload[offset + 5];
+            if (entryLength is < 10 or > 80 || nameLength is < 3 or > 40 ||
+                offset + 6 + nameLength > payload.Length) continue;
+            var map = MapWinRateCatalog.FindByGameId(mapId);
+            if (map is null) continue;
+            try
+            {
+                var shortName = new UTF8Encoding(false, true).GetString(payload.Slice(offset + 6, nameLength));
+                if (!shortName.All(character => char.IsLetterOrDigit(character) || character is ' ' or '-' or '_'))
+                    continue;
+                maps.Add(map);
+            }
+            catch (DecoderFallbackException) { }
+        }
+        return maps.ToArray();
     }
 
     private static bool TryReadVarint(ReadOnlySpan<byte> data, int offset, out ulong value, out int next)

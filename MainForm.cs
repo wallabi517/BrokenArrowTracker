@@ -27,6 +27,8 @@ public sealed class MainForm : Form
     private Label? enemyTitle;
     private Label? enemySummary;
     private TableLayoutPanel? enemyTable;
+    private Panel? mapPanel;
+    private string[] lastMapCandidates = [];
     private readonly Dictionary<string, LobbyRow> lobbyRows = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, LobbyRow> enemyRows = new(StringComparer.OrdinalIgnoreCase);
     private PlayerResult[] displayedPlayers = [];
@@ -39,7 +41,7 @@ public sealed class MainForm : Form
     {
         trackerSettings = new TrackerSettingsStore();
         capture = new PacketCaptureService(trackerSettings.SteamPath);
-        Text = "Broken Arrow Player Tracker"; Width = 1080; Height = 680; MinimumSize = new Size(900, 560);
+        Text = "Broken Arrow Player Tracker"; Width = 1280; Height = 900; MinimumSize = new Size(1000, 720);
         BackColor = Canvas; ForeColor = Primary; Font = new Font("Bahnschrift", 10f); StartPosition = FormStartPosition.CenterScreen;
         Controls.Add(content); Controls.Add(BuildHeader());
         capture.StatusChanged += text => { if (!IsDisposed && IsHandleCreated) BeginInvoke(() => SetCaptureStatus(text)); };
@@ -221,6 +223,9 @@ public sealed class MainForm : Form
     private async Task LoadPlayersAsync(LobbySnapshot lobby, bool force = false)
     {
         lastLobbySnapshot = lobby;
+        var incomingMaps = (lobby.CandidateMaps ?? Array.Empty<string>()).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        var mapsChanged = !incomingMaps.SequenceEqual(lastMapCandidates, StringComparer.OrdinalIgnoreCase);
+        if (mapsChanged) lastMapCandidates = incomingMaps;
         var matchPlayers = lobby.MatchPlayers?.Where(player => player.Team is 1 or 2).ToArray() ?? [];
         var localName = SteamIdentity.TryGetPersonaName(trackerSettings.SteamPath);
         var localTeam = matchPlayers.FirstOrDefault(player =>
@@ -251,7 +256,7 @@ public sealed class MainForm : Form
         }
         var normalized = names.Distinct(StringComparer.OrdinalIgnoreCase).Take(64).ToArray();
         DiagnosticLog.Write(lobby.IsMatch ? "MATCH" : "LOBBY", $"room={lobby.RoomName ?? "-"} marker={lobby.HasLobbyMarker} candidates=[{string.Join(" | ", normalized)}]");
-        if (!force && normalized.SequenceEqual(lastNames, StringComparer.OrdinalIgnoreCase) &&
+        if (!force && !mapsChanged && normalized.SequenceEqual(lastNames, StringComparer.OrdinalIgnoreCase) &&
             string.Equals(lobby.RoomName, lastRoomName, StringComparison.OrdinalIgnoreCase) &&
             DateTime.UtcNow - lastLookupUtc < TimeSpan.FromSeconds(30)) return;
 
@@ -277,16 +282,30 @@ public sealed class MainForm : Form
                 GlobalRank: null, Level: null, RatingGames: null, Kd: null, TurtleIndex: null,
                 AvatarUrl: null, UpdatedAt: null, Source: "Packet");
             }, StringComparer.OrdinalIgnoreCase);
+        var existingPlayers = displayedPlayers.GroupBy(player => player.Name, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
         var trustedLobbyPlayers = !lobby.IsMatch && lobby.PlayersAreTrusted
-            ? normalized.ToDictionary(name => name, name => new PlayerResult(name, name, SteamId: null, Elo: null,
-                GlobalRank: null, Level: null, RatingGames: null, Kd: null, TurtleIndex: null,
-                AvatarUrl: null, UpdatedAt: null, Source: "Lobby"), StringComparer.OrdinalIgnoreCase)
+            ? normalized.ToDictionary(name => name, name => existingPlayers.GetValueOrDefault(name) ??
+                new PlayerResult(name, name, SteamId: null, Elo: null,
+                    GlobalRank: null, Level: null, RatingGames: null, Kd: null, TurtleIndex: null,
+                    AvatarUrl: null, UpdatedAt: null, Source: "Lobby"), StringComparer.OrdinalIgnoreCase)
             : new Dictionary<string, PlayerResult>(StringComparer.OrdinalIgnoreCase);
         var identifiedPlayerIds = (lobby.IdentifiedPlayers ?? lobby.MatchPlayers ?? Array.Empty<MatchPlayer>())
             .GroupBy(player => player.Name, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(group => group.Key, group => group.First().Id.ToString(), StringComparer.OrdinalIgnoreCase);
         if (lobby.IsMatch && !settingsOpen)
             ShowMatchRoster(packetPlayers.Values.ToArray(), selectedMatchPlayers, localTeam, removeMissing: true);
+        else if (!lobby.IsMatch && trustedLobbyPlayers.Count > 0 && !settingsOpen)
+        {
+            var immediateRoster = normalized
+                .Where(trustedLobbyPlayers.ContainsKey)
+                .Select(name => (Name: name, Player: (PlayerResult?)trustedLobbyPlayers[name]))
+                .ToArray();
+            displayedPlayers = immediateRoster.Select(item => item.Player!).ToArray();
+            ShowLobby(lobby.RoomName, immediateRoster, removeMissing: true);
+            connection.Text = "플레이어 정보 조회 중";
+            connection.ForeColor = Muted;
+        }
 
         var pending = normalized.Select(async name =>
         {
@@ -343,6 +362,7 @@ public sealed class MainForm : Form
     private void ShowMatchRoster(PlayerResult[] players, MatchPlayer[] roster, int? localTeam, bool removeMissing)
     {
         EnsureLobbyView(true);
+        UpdateMapPanel();
         var byName = players.GroupBy(player => player.Name, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
         var allies = roster.Where(player => localTeam is null || player.Team == localTeam)
@@ -351,8 +371,8 @@ public sealed class MainForm : Form
             .Select(player => byName.GetValueOrDefault(player.Name)).Where(player => player is not null).Cast<PlayerResult>().ToArray();
 
         UpdateRosterTable(lobbyTable!, lobbyRows, allies, removeMissing);
-        lobbyTitle!.Text = "아군";
-        lobbySummary!.Text = $"{allies.Length}명";
+        lobbyTitle!.Visible = false;
+        lobbySummary!.Visible = false;
         if (enemyTable is not null)
         {
             UpdateRosterTable(enemyTable, enemyRows, enemies, removeMissing);
@@ -360,6 +380,36 @@ public sealed class MainForm : Form
             enemySummary!.Text = $"{enemies.Length}명";
         }
         LayoutRosterSections();
+    }
+
+    private void UpdateMapPanel()
+    {
+        if (mapPanel is null || lobbyTable is null) return;
+        mapPanel.Controls.Clear();
+        mapPanel.Visible = lastMapCandidates.Length > 0;
+        lobbyTable.Top = mapPanel.Visible ? 156 : 24;
+        if (!mapPanel.Visible) return;
+
+        var cards = new FlowLayoutPanel { Location = new Point(14, 10), Height = 86,
+            Width = Math.Max(0, mapPanel.ClientSize.Width - 28), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
+            WrapContents = false, AutoScroll = true, BackColor = Surface };
+        foreach (var name in lastMapCandidates)
+        {
+            var stats = MapWinRateCatalog.Find(name);
+            if (stats is null) continue;
+            var card = new Panel { Width = 215, Height = 70, BackColor = Raised, Margin = new Padding(0, 0, 10, 0) };
+            card.Controls.Add(new Label { Text = stats.Name, AutoSize = true, Location = new Point(12, 9),
+                Font = new Font("Bahnschrift SemiBold", 10f), ForeColor = Primary });
+            var rateText = stats.RuWinRate is double ru && stats.UsWinRate is double us
+                ? $"US {us:P1}   RU {ru:P1}"
+                : "승률 통계 없음";
+            card.Controls.Add(new Label { Text = rateText, AutoSize = true,
+                Location = new Point(12, 33), Font = new Font("Bahnschrift SemiBold", 10f), ForeColor = Accent });
+            card.Controls.Add(new Label { Text = stats.Matches > 0 ? $"표본 {stats.Matches:N0}경기" : "BArmory 목록 확인", AutoSize = true, Location = new Point(12, 53),
+                Font = new Font("Bahnschrift", 8f), ForeColor = Muted });
+            cards.Controls.Add(card);
+        }
+        mapPanel.Controls.Add(cards);
     }
 
     private void UpdateRosterTable(TableLayoutPanel table, Dictionary<string, LobbyRow> rows,
@@ -428,8 +478,12 @@ public sealed class MainForm : Form
         lobbyPage = new Panel { Dock = DockStyle.Fill, BackColor = Canvas, AutoScroll = true };
         lobbyTitle = new Label { AutoSize = true, Location = new Point(28, 24), Font = new Font("Bahnschrift SemiBold", 20f), ForeColor = Primary };
         lobbySummary = new Label { AutoSize = true, Location = new Point(30, 61), ForeColor = Muted };
+        mapPanel = new Panel { Location = new Point(28, 24), Height = 108, BackColor = Surface,
+            Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right, Visible = false };
+        mapPanel.Width = lobbyPage.ClientSize.Width - 56;
+        mapPanel.Paint += DrawBorder;
         lobbyTable = BuildRosterTable(new Point(28, 100));
-        lobbyPage.Controls.AddRange([lobbyTitle, lobbySummary, lobbyTable]);
+        lobbyPage.Controls.AddRange([lobbyTitle, lobbySummary, mapPanel, lobbyTable]);
         if (wantsEnemyTable)
         {
             enemyTitle = new Label { AutoSize = true, Font = new Font("Bahnschrift SemiBold", 20f), ForeColor = Primary };
@@ -441,6 +495,7 @@ public sealed class MainForm : Form
         {
             if (lobbyTable is not null) lobbyTable.Width = lobbyPage.ClientSize.Width - 56;
             if (enemyTable is not null) enemyTable.Width = lobbyPage.ClientSize.Width - 56;
+            if (mapPanel is not null) mapPanel.Width = lobbyPage.ClientSize.Width - 56;
         };
         content.Controls.Add(lobbyPage);
     }
@@ -535,7 +590,7 @@ public sealed class MainForm : Form
         }
     }
 
-    private static string PlayerKey(PlayerResult player) => player.SteamId ?? player.Id;
+    private static string PlayerKey(PlayerResult player) => player.Name;
 
     private void EditPlayerNote(PlayerResult? player)
     {
@@ -566,6 +621,7 @@ public sealed class MainForm : Form
         enemyTitle = null;
         enemySummary = null;
         enemyTable = null;
+        mapPanel = null;
         lobbyRows.Clear();
         enemyRows.Clear();
         rosterViewIsMatch = false;
